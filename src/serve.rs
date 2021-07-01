@@ -7,7 +7,7 @@ use axum::routing::{nest, BoxRoute};
 use axum::{prelude::*, AddExtensionLayer};
 use hyper::{Body, Request, Response, Server, StatusCode};
 use hyper_staticfile::{resolve_path, ResolveResult, ResponseBuilder};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 use tower_http::trace::TraceLayer;
 
@@ -24,14 +24,22 @@ pub struct ServeSystem {
     watch: WatchSystem,
     http_addr: String,
     shutdown_tx: broadcast::Sender<()>,
+    build_done_rx: watch::Receiver<()>,
 }
 
 impl ServeSystem {
     /// Construct a new instance.
     pub async fn new(cfg: Arc<RtcServe>, shutdown: broadcast::Sender<()>) -> Result<Self> {
-        let watch = WatchSystem::new(cfg.watch.clone(), shutdown.clone()).await?;
+        let (build_done_tx, build_done_rx) = watch::channel(());
+        let watch = WatchSystem::new(cfg.watch.clone(), shutdown.clone(), Some(build_done_tx)).await?;
         let http_addr = format!("http://127.0.0.1:{}{}", cfg.port, &cfg.watch.build.public_url);
-        Ok(Self { cfg, watch, http_addr, shutdown_tx: shutdown })
+        Ok(Self {
+            cfg,
+            watch,
+            http_addr,
+            shutdown_tx: shutdown,
+            build_done_rx,
+        })
     }
 
     /// Run the serve system.
@@ -40,7 +48,7 @@ impl ServeSystem {
         // Spawn the watcher & the server.
         let _build_res = self.watch.build().await; // TODO: only open after a successful build.
         let watch_handle = tokio::spawn(self.watch.run());
-        let server_handle = Self::spawn_server(self.cfg.clone(), self.shutdown_tx.subscribe())?;
+        let server_handle = Self::spawn_server(self.cfg.clone(), self.shutdown_tx.subscribe(), self.build_done_rx)?;
 
         // Open the browser.
         if self.cfg.open {
@@ -58,8 +66,23 @@ impl ServeSystem {
         Ok(())
     }
 
+    // async fn build_notify_task(mut build_done_rx: watch::Receiver<()>, websockets: WebSockets) {
+    //     while let Some(_) = build_done_rx.next().await {
+    //         let mut ws_guard = websockets.lock().await;
+    //         let mut to_remove = vec![];
+    //         for (idx, ws) in ws_guard.iter_mut().enumerate() {
+    //             if ws.send_string(r#"{"reload": true}"#.to_string()).await.is_err() {
+    //                 to_remove.push(idx);
+    //             }
+    //         }
+    //         for idx in to_remove.into_iter().rev() {
+    //             ws_guard.remove(idx);
+    //         }
+    //     }
+    // }
+
     #[tracing::instrument(level = "trace", skip(cfg, shutdown_rx))]
-    fn spawn_server(cfg: Arc<RtcServe>, mut shutdown_rx: broadcast::Receiver<()>) -> Result<JoinHandle<()>> {
+    fn spawn_server(cfg: Arc<RtcServe>, mut shutdown_rx: broadcast::Receiver<()>, build_done_rx: watch::Receiver<()>) -> Result<JoinHandle<()>> {
         // Build a shutdown signal for the warp server.
         let shutdown_fut = async move {
             // Any event on this channel, even a drop, should trigger shutdown.
@@ -73,7 +96,12 @@ impl ServeSystem {
             .context("error building proxy client")?;
 
         // Build the server.
-        let state = Arc::new(State::new(cfg.watch.build.final_dist.clone(), cfg.watch.build.public_url.clone(), client));
+        let state = Arc::new(State::new(
+            cfg.watch.build.final_dist.clone(),
+            cfg.watch.build.public_url.clone(),
+            client,
+            build_done_rx,
+        ));
         let router = router(state, cfg.clone());
         let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
         let server = Server::bind(&addr)
@@ -98,12 +126,14 @@ pub struct State {
     pub dist_dir: PathBuf,
     /// The public URL from which assets are being served.
     pub public_url: String,
+    /// The channel to receive build_done notifications on.
+    pub build_done_rx: watch::Receiver<()>,
 }
 
 impl State {
     /// Construct a new instance.
-    pub fn new(dist_dir: PathBuf, public_url: String, client: reqwest::Client) -> Self {
-        Self { client, dist_dir, public_url }
+    pub fn new(dist_dir: PathBuf, public_url: String, client: reqwest::Client, build_done_rx: watch::Receiver<()>) -> Self {
+        Self { client, dist_dir, public_url, build_done_rx }
     }
 }
 
@@ -182,7 +212,18 @@ fn router(state: Arc<State>, cfg: Arc<RtcServe>) -> BoxRoute<Body> {
         }
     }
 
+    if !cfg.no_autoreload {
+        router = router.route("/_trunk/ws", axum::ws::ws(handle_ws)).boxed();
+    }
+
     router
+}
+
+async fn handle_ws(mut ws: axum::ws::WebSocket, state: extract::Extension<Arc<State>>) {
+    let mut rx = state.build_done_rx.clone();
+    while let Ok(_) = rx.changed().await {
+        let _ = ws.send(axum::ws::Message::text(r#"{"reload": true}"#)).await;
+    }
 }
 
 /// A result type used to work seamlessly with axum.

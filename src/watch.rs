@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use futures::prelude::*;
 use notify::{recommended_watcher, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::BroadcastStream;
 
 use crate::build::BuildSystem;
@@ -27,11 +27,13 @@ pub struct WatchSystem {
     _watcher: RecommendedWatcher,
     /// The application shutdown channel.
     shutdown: BroadcastStream<()>,
+    /// Channel that is sent on whenever a build completes.
+    build_done_tx: Option<watch::Sender<()>>,
 }
 
 impl WatchSystem {
     /// Create a new instance.
-    pub async fn new(cfg: Arc<RtcWatch>, shutdown: broadcast::Sender<()>) -> Result<Self> {
+    pub async fn new(cfg: Arc<RtcWatch>, shutdown: broadcast::Sender<()>, build_done_tx: Option<watch::Sender<()>>) -> Result<Self> {
         // Create a channel for being able to listen for new paths to ignore while running.
         let (watch_tx, watch_rx) = mpsc::channel(1);
         let (build_tx, build_rx) = mpsc::channel(1);
@@ -48,6 +50,7 @@ impl WatchSystem {
             build_rx,
             _watcher,
             shutdown: BroadcastStream::new(shutdown.subscribe()),
+            build_done_tx,
         })
     }
 
@@ -104,6 +107,11 @@ impl WatchSystem {
 
             tracing::debug!("change detected in {:?}", ev_path);
             let _res = self.build.build().await;
+
+            if let Some(tx) = self.build_done_tx.as_mut() {
+                let _ = tx.send(());
+            }
+
             return; // If one of the paths triggers a build, then we're done.
         }
     }
