@@ -109,6 +109,7 @@ impl WatchSystem {
             let _res = self.build.build().await;
 
             if let Some(tx) = self.build_done_tx.as_mut() {
+                tracing::error!("sending build done");
                 let _ = tx.send(());
             }
 

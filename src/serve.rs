@@ -145,9 +145,30 @@ async fn serve_dist(req: Request<Body>) -> ServerResult<Response<Body>> {
         .get::<Arc<State>>()
         .context("error accessing request state")?;
     let accept_header_opt = req.headers().get("accept").map(|val| val.to_str());
+
     let res = resolve_path(state.dist_dir.as_path(), req.uri().path())
         .await
         .context("error serving from dist dir")?;
+
+    let inject_autoreload_js = ["/", INDEX_HTML].contains(&req.uri().path());
+    if inject_autoreload_js {
+        match res {
+            ResolveResult::Found(mut file, _, _) => {
+                use tokio::io::AsyncReadExt;
+                let mut b = Vec::new();
+                file.read_to_end(&mut b).await.context("failed to read file")?;
+
+                let b = inject_reload_script(&b).unwrap_or(b);
+                let body = Body::from(b);
+
+                return Ok(axum::http::response::Builder::new()
+                    .header("Content-Type", "text/html")
+                    .body(body)
+                    .context("error")?);
+            }
+            _ => {}
+        }
+    }
 
     // If the target file was not found, we have an accept header, and that accept header allows
     // for HTML to be returned, then move on to attempt to serve the index.html. Else, respond.
@@ -176,14 +197,20 @@ async fn serve_dist(req: Request<Body>) -> ServerResult<Response<Body>> {
 /// (for autoreload & HMR in the future), as well as any user-defined proxies.
 fn router(state: Arc<State>, cfg: Arc<RtcServe>) -> BoxRoute<Body> {
     // Build static file server, middleware, error handler & WS route for reloads.
-    let mut router = nest(
+    let mut router = 
+    // route("/_trunk/ws", axum::ws::ws(handle_ws))
+    nest(
         &state.public_url,
         get(serve_dist
             .layer(AddExtensionLayer::new(state.clone()))
             .layer(TraceLayer::new_for_http())),
     )
+        .route("/_trunk/ws", axum::ws::ws(handle_ws))
     // NOTE: @kcking let's add the auto-reload WS handler here.
     .boxed();
+    if !cfg.no_autoreload {
+        // router = router.route("/_trunk/ws", axum::ws::ws(handle_ws)).boxed();
+    }
 
     tracing::info!("{} serving static assets at -> {}", SERVER, state.public_url.as_str());
 
@@ -212,18 +239,32 @@ fn router(state: Arc<State>, cfg: Arc<RtcServe>) -> BoxRoute<Body> {
         }
     }
 
-    if !cfg.no_autoreload {
-        router = router.route("/_trunk/ws", axum::ws::ws(handle_ws)).boxed();
-    }
-
     router
 }
 
 async fn handle_ws(mut ws: axum::ws::WebSocket, state: extract::Extension<Arc<State>>) {
     let mut rx = state.build_done_rx.clone();
+    tracing::error!("ws start");
     while let Ok(_) = rx.changed().await {
-        let _ = ws.send(axum::ws::Message::text(r#"{"reload": true}"#)).await;
+        tracing::error!("ws rx");
+        if ws.send(axum::ws::Message::text(r#"{"reload": true}"#)).await.is_err() {
+            tracing::error!("ws end");
+            return;
+        }
+        tracing::error!("ws sent");
     }
+}
+
+const RELOAD_SCRIPT: &'static str = include_str!("autoreload.js");
+fn inject_reload_script(html: &Vec<u8>) -> Option<Vec<u8>> {
+    let html = std::str::from_utf8(&html).ok()?;
+
+    let document = nipper::Document::from(html);
+    document
+        .select("body")
+        .append_html(format!("<script>{}</script>", RELOAD_SCRIPT));
+
+    Some(document.html().to_string().as_bytes().to_vec())
 }
 
 /// A result type used to work seamlessly with axum.
